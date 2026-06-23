@@ -1,5 +1,6 @@
-import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord, CustomEquivalentDomain } from '../types';
+import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord, CustomEquivalentDomain, AccountPasskeyChallenge, AccountPasskeyChallengeScope, AccountPasskeyCredential, AuthRequestRecord } from '../types';
 import { LIMITS } from '../config/limits';
+import { ensurePushInstallationCredentials } from './push-relay';
 import { ensureStorageSchema } from './storage-schema';
 import {
   getConfigValue as getStoredConfigValue,
@@ -87,10 +88,12 @@ import {
 import {
   deleteDevice as deleteStoredDevice,
   deleteDevicesByUserId as deleteStoredDevicesByUserId,
+  clearDevicePushToken as clearStoredDevicePushToken,
   clearDeviceKeys as clearStoredDeviceKeys,
   deleteTrustedTwoFactorTokensByDevice as deleteStoredTrustedTokensByDevice,
   deleteTrustedTwoFactorTokensByUserId as deleteStoredTrustedTokensByUserId,
   getDevice as findStoredDevice,
+  getDevicePushUuid as findStoredDevicePushUuid,
   getDevicesByUserId as listStoredDevicesByUserId,
   getTrustedDeviceTokenSummariesByUserId as listStoredTrustedTokenSummaries,
   getTrustedTwoFactorDeviceTokenUserId as findStoredTrustedTokenUserId,
@@ -101,8 +104,19 @@ import {
   upsertDevice as saveStoredDevice,
   updateDeviceName as updateStoredDeviceName,
   updateDeviceKeys as updateStoredDeviceKeys,
+  updateDevicePushToken as updateStoredDevicePushToken,
   updateTrustedTwoFactorTokensExpiryByDevice as updateStoredTrustedTokensExpiryByDevice,
+  userHasPushDevice as getUserHasPushDevice,
 } from './storage-device-repo';
+import {
+  createAuthRequest as createStoredAuthRequest,
+  getAuthRequestById as findStoredAuthRequestById,
+  listAuthRequestsByUserId as listStoredAuthRequestsByUserId,
+  listPendingAuthRequestsByUserId as listStoredPendingAuthRequestsByUserId,
+  markAuthRequestAuthenticated as markStoredAuthRequestAuthenticated,
+  pruneExpiredAuthRequests as pruneStoredExpiredAuthRequests,
+  updateAuthRequestResponse as updateStoredAuthRequestResponse,
+} from './storage-auth-request-repo';
 import {
   ensureUsedAttachmentDownloadTokenTable as ensureStoredAttachmentTokenTable,
   consumeAttachmentDownloadToken as consumeStoredAttachmentDownloadToken,
@@ -115,6 +129,18 @@ import {
   getUserDomainSettings as getStoredUserDomainSettings,
   saveUserDomainSettings as saveStoredUserDomainSettings,
 } from './storage-domain-rules-repo';
+import {
+  consumeAccountPasskeyChallenge as consumeStoredAccountPasskeyChallenge,
+  countAccountPasskeyCredentialsByUserId as countStoredAccountPasskeyCredentialsByUserId,
+  deleteAccountPasskeyCredential as deleteStoredAccountPasskeyCredential,
+  getAccountPasskeyCredentialByCredentialId as findStoredAccountPasskeyCredentialByCredentialId,
+  getAccountPasskeyCredentialById as findStoredAccountPasskeyCredentialById,
+  listAccountPasskeyCredentialsByUserId as listStoredAccountPasskeyCredentialsByUserId,
+  saveAccountPasskeyChallenge as saveStoredAccountPasskeyChallenge,
+  saveAccountPasskeyCredential as saveStoredAccountPasskeyCredential,
+  updateAccountPasskeyCounter as updateStoredAccountPasskeyCounter,
+  updateAccountPasskeyEncryption as updateStoredAccountPasskeyEncryption,
+} from './storage-account-passkey-repo';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
@@ -122,7 +148,8 @@ const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
 // Bump this whenever src/services/storage-schema.ts or migrations/0001_init.sql
 // changes. Existing D1 installs only rerun ensureStorageSchema() when this value
 // differs from config.schema.version.
-const STORAGE_SCHEMA_VERSION = '2026-05-14-lightweight-audit-logs';
+const STORAGE_SCHEMA_VERSION = '2026-06-22-push-notifications';
+const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests'] as const;
 
 // D1-backed storage.
 // Contract:
@@ -151,6 +178,16 @@ export class StorageService {
    */
   private safeBind(stmt: D1PreparedStatement, ...values: any[]): D1PreparedStatement {
     return stmt.bind(...values.map(v => v === undefined ? null : v));
+  }
+
+  private async hasRequiredSchemaTables(): Promise<boolean> {
+    const placeholders = REQUIRED_SCHEMA_TABLES.map(() => '?').join(', ');
+    const result = await this.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+      .bind(...REQUIRED_SCHEMA_TABLES)
+      .all<{ name: string }>();
+    const found = new Set((result.results || []).map((row) => row.name));
+    return REQUIRED_SCHEMA_TABLES.every((table) => found.has(table));
   }
 
   private sqlChunkSize(fixedBindCount: number): number {
@@ -196,10 +233,14 @@ export class StorageService {
 
     await this.db.prepare('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)').run();
     const schemaVersion = await getStoredConfigValue(this.db, STORAGE_SCHEMA_VERSION_KEY);
-    if (schemaVersion !== STORAGE_SCHEMA_VERSION) {
+    const schemaMissingRequiredTables = schemaVersion === STORAGE_SCHEMA_VERSION
+      ? !(await this.hasRequiredSchemaTables())
+      : true;
+    if (schemaVersion !== STORAGE_SCHEMA_VERSION || schemaMissingRequiredTables) {
       await ensureStorageSchema(this.db);
       await saveConfigValue(this.db, STORAGE_SCHEMA_VERSION_KEY, STORAGE_SCHEMA_VERSION);
     }
+    await ensurePushInstallationCredentials(this.db);
 
     StorageService.schemaVerified = true;
   }
@@ -321,6 +362,73 @@ export class StorageService {
       new Date().toISOString()
     );
     await this.updateRevisionDate(userId);
+  }
+
+  // --- Account passkeys / WebAuthn login credentials ---
+
+  async saveAccountPasskeyCredential(credential: AccountPasskeyCredential): Promise<void> {
+    await saveStoredAccountPasskeyCredential(this.db, this.safeBind.bind(this), credential);
+  }
+
+  async getAccountPasskeyCredentialsByUserId(userId: string): Promise<AccountPasskeyCredential[]> {
+    return listStoredAccountPasskeyCredentialsByUserId(this.db, userId);
+  }
+
+  async getAccountPasskeyCredentialById(userId: string, id: string): Promise<AccountPasskeyCredential | null> {
+    return findStoredAccountPasskeyCredentialById(this.db, userId, id);
+  }
+
+  async getAccountPasskeyCredentialByCredentialId(credentialId: string): Promise<AccountPasskeyCredential | null> {
+    return findStoredAccountPasskeyCredentialByCredentialId(this.db, credentialId);
+  }
+
+  async countAccountPasskeyCredentialsByUserId(userId: string): Promise<number> {
+    return countStoredAccountPasskeyCredentialsByUserId(this.db, userId);
+  }
+
+  async updateAccountPasskeyCounter(
+    userId: string,
+    credentialId: string,
+    counter: number,
+    updatedAt: string = new Date().toISOString()
+  ): Promise<void> {
+    await updateStoredAccountPasskeyCounter(this.db, userId, credentialId, counter, updatedAt);
+  }
+
+  async updateAccountPasskeyEncryption(
+    userId: string,
+    credentialId: string,
+    encryptedUserKey: string,
+    encryptedPublicKey: string,
+    encryptedPrivateKey: string,
+    updatedAt: string = new Date().toISOString()
+  ): Promise<boolean> {
+    return updateStoredAccountPasskeyEncryption(
+      this.db,
+      userId,
+      credentialId,
+      encryptedUserKey,
+      encryptedPublicKey,
+      encryptedPrivateKey,
+      updatedAt
+    );
+  }
+
+  async deleteAccountPasskeyCredential(userId: string, id: string): Promise<boolean> {
+    return deleteStoredAccountPasskeyCredential(this.db, userId, id);
+  }
+
+  async saveAccountPasskeyChallenge(challenge: AccountPasskeyChallenge): Promise<void> {
+    await saveStoredAccountPasskeyChallenge(this.db, challenge);
+  }
+
+  async consumeAccountPasskeyChallenge(
+    challengeHash: string,
+    scope: AccountPasskeyChallengeScope,
+    userId: string | null,
+    nowMs: number = Date.now()
+  ): Promise<AccountPasskeyChallenge | null> {
+    return consumeStoredAccountPasskeyChallenge(this.db, challengeHash, scope, userId, nowMs);
   }
 
   // --- Ciphers ---
@@ -611,6 +719,27 @@ export class StorageService {
     return touchStoredDeviceLastSeen(this.db, userId, deviceIdentifier);
   }
 
+  async updateDevicePushToken(
+    userId: string,
+    deviceIdentifier: string,
+    pushUuid: string,
+    pushToken: string
+  ): Promise<boolean> {
+    return updateStoredDevicePushToken(this.db, userId, deviceIdentifier, pushUuid, pushToken);
+  }
+
+  async clearDevicePushToken(userId: string, deviceIdentifier: string): Promise<{ pushUuid: string | null } | null> {
+    return clearStoredDevicePushToken(this.db, userId, deviceIdentifier);
+  }
+
+  async getDevicePushUuid(userId: string, deviceIdentifier: string): Promise<string | null> {
+    return findStoredDevicePushUuid(this.db, userId, deviceIdentifier);
+  }
+
+  async userHasPushDevice(userId: string): Promise<boolean> {
+    return getUserHasPushDevice(this.db, userId);
+  }
+
   async clearDeviceKeys(userId: string, deviceIdentifiers: string[]): Promise<number> {
     return clearStoredDeviceKeys(this.db, userId, deviceIdentifiers);
   }
@@ -621,6 +750,45 @@ export class StorageService {
 
   async deleteDevicesByUserId(userId: string): Promise<number> {
     return deleteStoredDevicesByUserId(this.db, userId);
+  }
+
+  // --- Auth requests / Login with device ---
+
+  async createAuthRequest(request: AuthRequestRecord): Promise<void> {
+    await createStoredAuthRequest(this.db, request);
+  }
+
+  async getAuthRequestById(id: string): Promise<AuthRequestRecord | null> {
+    return findStoredAuthRequestById(this.db, id);
+  }
+
+  async listAuthRequestsByUserId(userId: string): Promise<AuthRequestRecord[]> {
+    return listStoredAuthRequestsByUserId(this.db, userId);
+  }
+
+  async listPendingAuthRequestsByUserId(userId: string): Promise<AuthRequestRecord[]> {
+    return listStoredPendingAuthRequestsByUserId(this.db, userId);
+  }
+
+  async updateAuthRequestResponse(
+    id: string,
+    userId: string,
+    update: {
+      approved: boolean;
+      responseDeviceIdentifier: string;
+      key?: string | null;
+      masterPasswordHash?: string | null;
+    }
+  ): Promise<boolean> {
+    return updateStoredAuthRequestResponse(this.db, id, userId, update);
+  }
+
+  async markAuthRequestAuthenticated(id: string): Promise<boolean> {
+    return markStoredAuthRequestAuthenticated(this.db, id);
+  }
+
+  async pruneExpiredAuthRequests(): Promise<number> {
+    return pruneStoredExpiredAuthRequests(this.db);
   }
 
   async getTrustedDeviceTokenSummariesByUserId(userId: string): Promise<TrustedDeviceTokenSummary[]> {

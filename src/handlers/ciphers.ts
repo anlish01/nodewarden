@@ -11,7 +11,13 @@ import {
   PasswordHistory,
 } from '../types';
 import { StorageService } from '../services/storage';
-import { notifyUserVaultSync } from '../durable/notifications-hub';
+import {
+  notifyUserCipherCreate,
+  notifyUserCipherDelete,
+  notifyUserCipherUpdate,
+  notifyUserCiphersSync,
+  notifyUserVaultSync,
+} from '../durable/notifications-hub';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { deleteAllAttachmentsForCipher, deleteAllAttachmentsForCiphers } from './attachments';
@@ -42,6 +48,22 @@ function normalizeOptionalId(value: unknown): string | null {
   return normalized ? normalized : null;
 }
 
+function readBooleanOrFallback(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function buildCipherPermissions(passthrough: Record<string, unknown>): { delete: boolean; restore: boolean } {
+  const raw = passthrough.permissions;
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : null;
+
+  return {
+    delete: readBooleanOrFallback(source?.delete, true),
+    restore: readBooleanOrFallback(source?.restore, true),
+  };
+}
+
 function notifyVaultSyncForRequest(
   request: Request,
   env: Env,
@@ -49,6 +71,60 @@ function notifyVaultSyncForRequest(
   revisionDate: string
 ): void {
   notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+}
+
+function notifyCipherCreateForRequest(
+  request: Request,
+  env: Env,
+  cipher: Cipher,
+  revisionDate: string
+): void {
+  notifyUserCipherCreate(env, {
+    userId: cipher.userId,
+    cipherId: cipher.id,
+    revisionDate,
+    organizationId: normalizeOptionalId((cipher as any).organizationId ?? null),
+    collectionIds: Array.isArray((cipher as any).collectionIds)
+      ? (cipher as any).collectionIds.map((id: unknown) => String(id || '').trim()).filter(Boolean)
+      : null,
+    contextId: readActingDeviceIdentifier(request),
+  });
+}
+
+function notifyCipherUpdateForRequest(
+  request: Request,
+  env: Env,
+  cipher: Cipher,
+  revisionDate: string
+): void {
+  notifyUserCipherUpdate(env, {
+    userId: cipher.userId,
+    cipherId: cipher.id,
+    revisionDate,
+    organizationId: normalizeOptionalId((cipher as any).organizationId ?? null),
+    collectionIds: Array.isArray((cipher as any).collectionIds)
+      ? (cipher as any).collectionIds.map((id: unknown) => String(id || '').trim()).filter(Boolean)
+      : null,
+    contextId: readActingDeviceIdentifier(request),
+  });
+}
+
+function notifyCipherDeleteForRequest(
+  request: Request,
+  env: Env,
+  cipher: Cipher,
+  revisionDate: string
+): void {
+  notifyUserCipherDelete(env, {
+    userId: cipher.userId,
+    cipherId: cipher.id,
+    revisionDate,
+    organizationId: normalizeOptionalId((cipher as any).organizationId ?? null),
+    collectionIds: Array.isArray((cipher as any).collectionIds)
+      ? (cipher as any).collectionIds.map((id: unknown) => String(id || '').trim()).filter(Boolean)
+      : null,
+    contextId: readActingDeviceIdentifier(request),
+  });
 }
 
 function getAliasedProp(source: any, aliases: string[]): { present: boolean; value: any } {
@@ -141,6 +217,12 @@ function optionalEncString(value: unknown): string | null {
   return isValidEncString(value) ? value.trim() : null;
 }
 
+function optionalEncStringWithin(value: unknown, maxLength: number): string | null {
+  const normalized = optionalEncString(value);
+  if (!normalized) return null;
+  return normalized.length <= maxLength ? normalized : null;
+}
+
 function shouldAcceptCipherKey(value: unknown): boolean {
   return value == null || value === '' || isValidEncString(value);
 }
@@ -151,13 +233,16 @@ function normalizeCipherKeyForStorage(value: unknown): string | null {
 
 function sanitizeEncryptedObject<T extends Record<string, any>>(
   source: T | null | undefined,
-  encryptedKeys: readonly string[]
+  encryptedKeys: readonly string[] | Record<string, number>
 ): T | null {
   if (!source || typeof source !== 'object') return source ?? null;
   const next: Record<string, any> = { ...source };
-  for (const key of encryptedKeys) {
+  const entries = Array.isArray(encryptedKeys)
+    ? encryptedKeys.map((key) => [key, 10000] as const)
+    : Object.entries(encryptedKeys);
+  for (const [key, maxLength] of entries) {
     if (!Object.prototype.hasOwnProperty.call(next, key)) continue;
-    next[key] = optionalEncString(next[key]);
+    next[key] = optionalEncStringWithin(next[key], maxLength);
   }
   return next as T;
 }
@@ -188,7 +273,12 @@ export function normalizeCipherLoginForCompatibility(
 ): any {
   const normalized = normalizeCipherLoginForStorage(login);
   if (!normalized || typeof normalized !== 'object') return normalized ?? null;
-  const next = sanitizeEncryptedObject(normalized, ['username', 'password', 'totp', 'uri']);
+  const next = sanitizeEncryptedObject(normalized, {
+    username: 1000,
+    password: 5000,
+    totp: 1000,
+    uri: 10000,
+  });
   if (!next) return null;
   next.uris = normalizeCipherLoginUrisForCompatibility(next.uris, {
     requiresUriChecksum,
@@ -214,23 +304,19 @@ function normalizeCipherLoginUrisForCompatibility(
     const hasChecksum = isValidEncString(next.uriChecksum);
     const hasMatch = next.match != null;
 
-    if (hasUri && hasChecksum) {
+    if (hasUri && String(next.uri).trim().length > 10000) continue;
+    if (hasChecksum && String(next.uriChecksum).trim().length > 10000) {
+      next.uriChecksum = null;
+    }
+
+    if (hasUri && isValidEncString(next.uriChecksum)) {
       out.push(next);
       continue;
     }
 
     if (hasUri && !hasChecksum) {
-      if (options.preserveRepairableUris) {
-        // Preserve the encrypted URI so NodeWarden Web can decrypt it and repair
-        // the missing checksum. Dropping it here makes the URI appear lost and
-        // can turn a display-only compatibility issue into data loss on save.
-        out.push({ ...next, uriChecksum: null });
-        continue;
-      }
-      // Bitwarden browser clients using the SDK drop item-key encrypted URIs
-      // whose checksum is missing/invalid. User-key encrypted legacy/import
-      // entries bypass this validation and can safely keep the URI.
-      if (options.requiresUriChecksum) continue;
+      // Official Bitwarden treats UriChecksum as nullable encrypted metadata.
+      // Keep the URI intact and let clients that can repair checksums do so.
       out.push({ ...next, uriChecksum: null });
       continue;
     }
@@ -243,14 +329,27 @@ function normalizeCipherLoginUrisForCompatibility(
   return out.length ? out : null;
 }
 
-function hasMissingLoginUriChecksum(cipher: Cipher): boolean {
-  if (!cipher.key || !cipher.login || typeof cipher.login !== 'object') return false;
-  const uris = (cipher.login as any).uris;
-  if (!Array.isArray(uris)) return false;
-  return uris.some((uri: any) => {
-    if (!uri || typeof uri !== 'object') return false;
-    return isValidEncString(uri.uri) && !isValidEncString(uri.uriChecksum);
-  });
+export function validateCipherEncryptedFieldsForCompatibility(cipher: Cipher): string | null {
+  if (cipher.name != null && !optionalEncStringWithin(cipher.name, 1000)) return 'Cipher name must be an encrypted string up to 1000 characters.';
+  if (cipher.notes != null && !optionalEncStringWithin(cipher.notes, 10000)) return 'Cipher notes must be an encrypted string up to 10000 characters.';
+
+  const login = cipher.login as any;
+  if (login && typeof login === 'object') {
+    if (login.username != null && !optionalEncStringWithin(login.username, 1000)) return 'Login username must be an encrypted string up to 1000 characters.';
+    if (login.password != null && !optionalEncStringWithin(login.password, 5000)) return 'Login password must be an encrypted string up to 5000 characters.';
+    if (login.totp != null && !optionalEncStringWithin(login.totp, 1000)) return 'Login TOTP must be an encrypted string up to 1000 characters.';
+    if (login.uri != null && !optionalEncStringWithin(login.uri, 10000)) return 'Login URI must be an encrypted string up to 10000 characters.';
+
+    if (Array.isArray(login.uris)) {
+      for (const uri of login.uris) {
+        if (!uri || typeof uri !== 'object') continue;
+        if (uri.uri != null && !optionalEncStringWithin(uri.uri, 10000)) return 'Login URI must be an encrypted string up to 10000 characters.';
+        if (uri.uriChecksum != null && !optionalEncStringWithin(uri.uriChecksum, 10000)) return 'Login URI checksum must be an encrypted string up to 10000 characters.';
+      }
+    }
+  }
+
+  return null;
 }
 
 function normalizeFido2CredentialsForCompatibility(credentials: any): any[] | null {
@@ -589,7 +688,14 @@ export function cipherToResponse(
     !!responseCipherKey,
     !!options.preserveRepairableUris
   );
-  const normalizedCard = sanitizeEncryptedObject((passthrough as any).card ?? null, ['cardholderName', 'brand', 'number', 'expMonth', 'expYear', 'code']);
+  const normalizedCard = sanitizeEncryptedObject((passthrough as any).card ?? null, {
+    cardholderName: 1000,
+    brand: 1000,
+    number: 1000,
+    expMonth: 1000,
+    expYear: 1000,
+    code: 1000,
+  });
   const normalizedIdentity = sanitizeEncryptedObject((passthrough as any).identity ?? null, [
     'title',
     'firstName',
@@ -615,6 +721,7 @@ export function cipherToResponse(
     ? normalizeCipherSecureNoteForCompatibility((passthrough as any).secureNote ?? null) ?? { type: 0 }
     : null;
   const responseAttachments = applyCipherEmbeddedAttachmentMetadata(cipher, attachments);
+  const responsePermissions = buildCipherPermissions(passthrough);
 
   return {
     // Pass through ALL stored cipher fields (known + unknown)
@@ -628,12 +735,9 @@ export function cipherToResponse(
     revisionDate: updatedAt,
     deletedDate: deletedAt,
     archivedDate: archivedAt ?? null,
-    edit: true,
-    viewPassword: true,
-    permissions: {
-      delete: true,
-      restore: true,
-    },
+    edit: readBooleanOrFallback((passthrough as any).edit, true),
+    viewPassword: readBooleanOrFallback((passthrough as any).viewPassword, true),
+    permissions: responsePermissions,
     object: 'cipherDetails',
     collectionIds: Array.isArray((passthrough as any).collectionIds) ? (passthrough as any).collectionIds : [],
     attachments: formatAttachments(responseAttachments),
@@ -647,6 +751,7 @@ export function cipherToResponse(
     passwordHistory: normalizePasswordHistoryForCompatibility((passthrough as any).passwordHistory),
     sshKey: normalizedSshKey,
     key: responseCipherKey,
+    data: typeof (passthrough as any).data === 'string' ? (passthrough as any).data : null,
     encryptedFor: (passthrough as any).encryptedFor ?? null,
   };
 }
@@ -772,6 +877,8 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
   const createFields = getAliasedProp(cipherData, ['fields', 'Fields']);
   cipher.fields = createFields.present ? (createFields.value ?? null) : (cipher.fields ?? null);
   normalizeCipherForStorage(cipher);
+  const compatibilityError = validateCipherEncryptedFieldsForCompatibility(cipher);
+  if (compatibilityError) return errorResponse(compatibilityError, 400);
 
   // Prevent referencing a folder owned by another user.
   if (cipher.folderId) {
@@ -779,13 +886,10 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
     if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
-  if (hasMissingLoginUriChecksum(cipher)) {
-    return errorResponse('Login URI checksum is required for item-key encrypted ciphers. Refresh NodeWarden and save the item again.', 400);
-  }
-
   await storage.saveCipher(cipher);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherCreateForRequest(request, env, cipher, revisionDate);
   const responseOptions = cipherResponseOptionsForRequest(request);
 
   return jsonResponse(
@@ -823,6 +927,9 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
   const incomingPasswordHistory = readCipherProp<PasswordHistory[] | null>(cipherData, ['passwordHistory', 'PasswordHistory']);
   const incomingRevisionDate = readCipherRevisionDate(cipherData);
   const hasAttachmentMigrationMetadata = hasIncomingAttachmentMetadata(cipherData);
+  const preserveRevisionDate =
+    shouldPreserveRepairableCipherUris(request)
+    && (body.preserveRevisionDate === true || cipherData.preserveRevisionDate === true);
 
   if (incomingKey.present && !shouldAcceptCipherKey(incomingKey.value)) {
     return errorResponse('Cipher key encryption is not supported by this server. Resync the client and try again.', 400);
@@ -832,17 +939,14 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     return errorResponse('The client copy of this cipher is out of date. Resync the client and try again.', 400);
   }
 
-  if (!shouldPreserveRepairableCipherUris(request) && incomingLogin.present && hasMissingLoginUriChecksum(existingCipher)) {
-    return errorResponse('This item has login URIs that must be repaired in NodeWarden Web before updating from this client. Open NodeWarden Web once, then resync.', 400);
-  }
-
   const nextType = Number(cipherData.type) || existingCipher.type;
 
   // Opaque passthrough: merge existing stored data with ALL incoming client fields.
   // Unknown/future fields from the client are preserved; server-controlled fields are protected.
+  const { preserveRevisionDate: _preserveRevisionDate, PreserveRevisionDate: _pascalPreserveRevisionDate, ...cipherDataWithoutFlags } = cipherData;
   const cipher: Cipher = {
     ...existingCipher,   // start with all existing stored data (including unknowns)
-    ...cipherData,       // overlay all client data (including new/unknown fields)
+    ...cipherDataWithoutFlags, // overlay all client data (including new/unknown fields)
     // Server-controlled fields (never from client)
     id: existingCipher.id,
     userId: existingCipher.userId,
@@ -850,7 +954,7 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     favorite: cipherData.favorite ?? existingCipher.favorite,
     reprompt: cipherData.reprompt ?? existingCipher.reprompt,
     createdAt: existingCipher.createdAt,
-    updatedAt: new Date().toISOString(),
+    updatedAt: preserveRevisionDate ? existingCipher.updatedAt : new Date().toISOString(),
     archivedAt: readCipherArchivedAt(cipherData, existingCipher.archivedAt ?? null),
     deletedAt: existingCipher.deletedAt,
   };
@@ -883,6 +987,8 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     cipher.fields = null;
   }
   normalizeCipherForStorage(cipher);
+  const compatibilityError = validateCipherEncryptedFieldsForCompatibility(cipher);
+  if (compatibilityError) return errorResponse(compatibilityError, 400);
 
   // Prevent referencing a folder owned by another user.
   if (cipher.folderId) {
@@ -890,14 +996,11 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
-  if (hasMissingLoginUriChecksum(cipher)) {
-    return errorResponse('Login URI checksum is required for item-key encrypted ciphers. Refresh NodeWarden and save the item again.', 400);
-  }
-
   await syncIncomingAttachmentMetadata(storage, cipher.id, cipherData);
   await storage.saveCipher(cipher);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
   const attachments = await storage.getAttachmentsByCipher(cipher.id);
   const responseOptions = cipherResponseOptionsForRequest(request);
 
@@ -922,6 +1025,7 @@ export async function handleDeleteCipher(request: Request, env: Env, userId: str
   await storage.saveCipher(cipher);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherDeleteForRequest(request, env, cipher, revisionDate);
   await writeCipherAudit(storage, request, userId, 'cipher.delete.soft', {
     id: cipher.id,
     type: cipher.type,
@@ -951,6 +1055,7 @@ export async function handleDeleteCipherCompat(request: Request, env: Env, userI
     await storage.deleteCipher(id, userId);
     const revisionDate = await storage.updateRevisionDate(userId);
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    notifyCipherDeleteForRequest(request, env, cipher, revisionDate);
     await writeCipherAudit(storage, request, userId, 'cipher.delete.permanent', {
       id,
       type: cipher.type,
@@ -978,6 +1083,7 @@ export async function handlePermanentDeleteCipher(request: Request, env: Env, us
   await storage.deleteCipher(id, userId);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherDeleteForRequest(request, env, cipher, revisionDate);
   await writeCipherAudit(storage, request, userId, 'cipher.delete.permanent', {
     id,
     type: cipher.type,
@@ -1002,6 +1108,7 @@ export async function handleRestoreCipher(request: Request, env: Env, userId: st
   await storage.saveCipher(cipher);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
   return jsonResponse(
     cipherToResponse(cipher, [], cipherResponseOptionsForRequest(request))
@@ -1041,6 +1148,7 @@ export async function handlePartialUpdateCipher(request: Request, env: Env, user
   await storage.saveCipher(cipher);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
   return jsonResponse(
     cipherToResponse(cipher, [], cipherResponseOptionsForRequest(request))
@@ -1117,6 +1225,7 @@ export async function handleArchiveCipher(request: Request, env: Env, userId: st
   await storage.saveCipher(cipher);
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
   const attachments = await storage.getAttachmentsByCipher(cipher.id);
   return jsonResponse(
@@ -1165,6 +1274,7 @@ export async function handleBulkArchiveCiphers(request: Request, env: Env, userI
   const revisionDate = await storage.bulkArchiveCiphers(ids, userId);
   if (revisionDate) {
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
   }
 
   return buildCipherListResponse(request, storage, userId, ids);
@@ -1189,6 +1299,7 @@ export async function handleBulkUnarchiveCiphers(request: Request, env: Env, use
   const revisionDate = await storage.bulkUnarchiveCiphers(ids, userId);
   if (revisionDate) {
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
   }
 
   return buildCipherListResponse(request, storage, userId, ids);
@@ -1212,6 +1323,7 @@ export async function handleBulkDeleteCiphers(request: Request, env: Env, userId
   const revisionDate = await storage.bulkSoftDeleteCiphers(body.ids, userId);
   if (revisionDate) {
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
     await writeCipherAudit(storage, request, userId, 'cipher.delete.soft.bulk', {
       count: body.ids.length,
     });
@@ -1238,6 +1350,7 @@ export async function handleBulkRestoreCiphers(request: Request, env: Env, userI
   const revisionDate = await storage.bulkRestoreCiphers(body.ids, userId);
   if (revisionDate) {
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
   }
 
   return new Response(null, { status: 204 });
@@ -1274,6 +1387,7 @@ export async function handleBulkPermanentDeleteCiphers(request: Request, env: En
   const revisionDate = await storage.bulkDeleteCiphers(ownedIds, userId);
   if (revisionDate) {
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
     await writeCipherAudit(storage, request, userId, 'cipher.delete.permanent.bulk', {
       count: ownedIds.length,
       requestedCount: ids.length,
