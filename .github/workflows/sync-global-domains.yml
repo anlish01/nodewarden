@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync-global-domains:
@@ -40,21 +39,16 @@ jobs:
       - name: Verify custom domains were not touched
         run: git diff --exit-code -- src/static/global_domains.custom.json
 
-      - name: Create pull request
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
-        with:
-          branch: chore/sync-bitwarden-global-domains
-          delete-branch: true
-          title: "chore: sync Bitwarden global domain rules"
-          commit-message: "chore: sync Bitwarden global domain rules"
-          body: |
-            Automated sync from bitwarden/server.
-
-            This PR only updates:
-            - `src/static/global_domains.bitwarden.json`
-            - `src/static/global_domains.bitwarden.meta.json`
-
-            `src/static/global_domains.custom.json` is intentionally left untouched.
-          add-paths: |
-            src/static/global_domains.bitwarden.json
-            src/static/global_domains.bitwarden.meta.json
+      - name: Commit & push directly to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/static/global_domains.bitwarden.json \
+                  src/static/global_domains.bitwarden.meta.json
+          # 上游无变化时不产生空提交，直接绿色结束
+          if git diff --cached --quiet; then
+            echo "ℹ️ 上游无变化，跳过推送"
+            exit 0
+          fi
+          git commit -m "chore: sync Bitwarden global domain rules"
+          git push origin HEAD:main
